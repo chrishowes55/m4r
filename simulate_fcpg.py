@@ -457,6 +457,8 @@ def compute_landau_over_grid(theta, tau_vals, mu_range, gamma, nu, zeta, T, init
             m_vals_double[i, j] = m
             pos_vals_double[i, j] = pos[2]
 
+    return c_vals_double, m_vals_double, pos_vals_double
+
 def log_power(x, a, b, c, d, e):
     mu, tau_rel = x
     tau = T*tau_rel
