@@ -3,11 +3,13 @@ import numpy as np
 import pandas as pd
 import os
 from scipy.special import logsumexp, gammaln, logit, softmax
+from scipy.linalg import expm
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import seaborn as sns   
-from scipy.stats import invweibull
+from scipy.stats import invweibull, curve_fit
 from scipy.integrate import quad
+from pysr import PySRRegressor
 
 def generate_next_timepoint(m, k, w, mu, gamma, nu, zeta, S, dt, rng=None):
     """
@@ -237,6 +239,13 @@ def stochastic_growth(theta, tau, mu, gamma, nu, zeta, T, NSIM, init = None):
 
     return betaCancer
 
+def analytic_calculation(t, theta, mu, gamma, nu, zeta):
+    B = np.array([[theta - 2 * gamma, nu, 0], [2 * gamma, theta - (nu + zeta), 2 * mu], [0, zeta, theta - 2 * mu]])
+
+    exponential = expm(t * B)
+
+    return (exponential[0, :] + 0.5 * exponential[1, :]) / np.exp(t * theta)
+
 def calculate_mixing_weight_lpmf(mu, gamma, nu, zeta, tau):
     # generate distribution of fCpG loci when population begins growing 
     # at t=tau
@@ -330,6 +339,129 @@ def calculate_spike_height(beta, mu):
 
     return 2 * scale * mu * np.log(2)/theta
 
+def compute_mean_var_over_grid(theta, tau_vals, mu_vals, gamma, nu, zeta, T, init):
+    # To iterate over just one variable, send a list of one element for the other
+
+    mean_val_grid = np.zeros((len(mu_vals), len(tau_vals)))
+    var_val_grid = np.zeros((len(mu_vals), len(tau_vals)))
+
+    for i in range(len(mu_vals)):
+        for j in range(len(tau_vals)):
+            betaPeak = stochastic_growth(theta, tau_vals[j] * T, mu_vals[i], gamma, nu, zeta, T, 10000, init)
+            mean_val_grid[i, j] = (np.mean(betaPeak[np.argwhere(betaPeak != 0.5)]))    # Exclude the spike from the calculation of the mean
+            var_val_grid[i, j] = (np.var(betaPeak[np.argwhere(betaPeak != 0.5)]))
+
+    return mean_val_grid, var_val_grid
+
+def logistic(x, a, b, c, d):
+    mu, tau_rel = x
+    tau = T*tau_rel
+    return (a*(mu*(T-tau))**b)/(1+c*(mu*(T-tau))**d)
+
+def bell_guess(x, p, q, r):
+    mu, tau_rel = x
+    tau = T*tau_rel
+    com = mu*(T-tau)
+    return com**p*np.exp(-q*com**r)
+
+def fit_curve(tau_vals, mu_vals, results_grid, p0, func):
+    tautau, mumu = np.meshgrid(tau_vals, mu_vals)
+    mu_flat = mumu.flatten().T
+    tau_flat = tautau.flatten().T
+    results_flat = results_grid.flatten().T
+
+    xdata = (mu_flat, tau_flat)
+
+    return curve_fit(func, xdata, results_flat, p0=p0)
+
+def calculate_r_squared(xdata, params, results_flat):
+    y_pred = logistic(xdata, *params)
+
+    # Calculate R^2 score
+    ss_res = np.sum((results_flat - y_pred) ** 2)  # Residual sum of squares
+    ss_tot = np.sum((results_flat - np.mean(results_flat)) ** 2)  # Total sum of squares
+    return 1 - (ss_res / ss_tot)
+
+def symbolic_regression(mu_range, tau_range, results):
+    # Initialise the model
+    model = PySRRegressor(
+        population_size=50,
+        ncycles_per_iteration=50,
+        niterations=100,
+        early_stop_condition=(
+            "stop_if(loss, complexity) = loss < 1e-6 && complexity < 10"
+        ),
+        timeout_in_seconds=60 * 60 * 24,
+        maxsize=50,
+        maxdepth=10,
+        binary_operators=["*", "+", "-", "/", "^"],
+        unary_operators=["square", "exp", "sqrt", "log"],
+        constraints={
+            "/": (-1, 9),
+            "square": 9,
+            "exp": 9,
+            "^": (-1, 1)
+        },
+        nested_constraints={
+            "square": {"square": 1, "exp": 0, "sqrt": 0, "log": 0},
+            "exp": {"square": 1, "exp": 0, "sqrt": 1, "log": 0},
+            "sqrt": {"square": 1, "exp": 1, "sqrt": 0, "log": 1},
+            "log": {"square": 1, "exp": 0, "sqrt": 1, "log": 0},
+        },
+        complexity_of_operators={"/": 2, "exp": 3},
+        complexity_of_constants=2,
+        progress=True,
+    )
+    tautau, mumu = np.meshgrid(tau_range, mu_range)
+    mu_flat = mumu.flatten().T
+    tau_flat = tautau.flatten().T
+    results_flat = results.flatten().T
+
+    X = np.zeros((len(mu_flat),))
+    X[:] = mu_flat * tau_flat
+
+    model.fit(X.reshape((-1, 1)), results_flat)
+
+def gamma_rvs(mean, variance):
+    alpha = mean**2 / variance
+    beta = mean / alpha
+    gamma_dist = stats.gamma(a=alpha, scale=beta)
+    return gamma_dist.rvs(size=10000)
+
+def lognormal_rvs(mean, variance):
+    sigma_sq = np.log(1 + (variance / mean**2))
+    mu_prime = np.log(mean**2 / np.sqrt(variance + mean**2))
+    sigma = np.sqrt(sigma_sq)
+
+    lognorm_dist = stats.lognorm(s=sigma, scale=np.exp(mu_prime))
+    return lognorm_dist.rvs(size=10000)
+
+def compute_landau_over_grid(theta, tau_vals, mu_range, gamma, nu, zeta, T, init):
+    # To iterate over just one variable, send a list of one element for the other
+
+    c_vals_double = np.zeros((len(mu_range), len(tau_vals)))
+    m_vals_double = np.zeros((len(mu_range), len(tau_vals)))
+    pos_vals_double = np.zeros((len(mu_range), len(tau_vals)))
+    for i in range(len(mu_range)):
+        for j in range(len(tau_vals)):
+            betaPeak = stochastic_growth(theta, tau_vals[j]*T, mu_range[i], gamma, nu, zeta, T, 10000, init)
+
+            pos = analytic_calculation(T - tau_vals[j]*T, theta, mu_range[i], gamma, nu, zeta)
+
+            loc, scale = stats.landau.fit(betaPeak)
+
+            c = scale
+            m = loc - (2 * c / np.pi * np.log(c))
+
+            c_vals_double[i, j] = c
+            m_vals_double[i, j] = m
+            pos_vals_double[i, j] = pos[2]
+
+def log_power(x, a, b, c, d, e):
+    mu, tau_rel = x
+    tau = T*tau_rel
+    return (a*mu**d/(1+c*mu**e))*(T-tau)**b
+
 T = 50
 tau = 45
 theta = 2.4
@@ -342,26 +474,15 @@ init = 0
 
 betaCancer = stochastic_growth(theta, tau, mu, gamma, nu, zeta, T, 10000, init)
 
-x = np.linspace(0, 1, 1001)
-# pdf = np.exp(combined_lpdf(x, theta, tau, mu, gamma, nu, zeta, T))
-
 fig, ax = plt.subplots()
-# frechet = stats.invweibull.rvs(*calculate_frechet_parameters(2*mu, theta, T-tau), size=10000)
-# plt.hist(frechet, bins = np.linspace(0, 1, 201), 
-        #  alpha = 0.4, density = True)
-
-
-spike = calculate_spike_height(betaCancer, mu)
 
 plt.hist(betaCancer, bins = np.linspace(0, 1, 201), 
          alpha = 0.4, density = True)
-plt.plot([0.5025, 0.5025], [0, spike], alpha=0.6, linewidth=10)
-# plt.plot(x, pdf)
 plt.xlabel('Population size')
 plt.ylabel('Probability density')
 plt.xlim(0.45, 0.55)
 plt.ylim(0, 10)
 plt.tight_layout()
-plt.legend(labels=["Analytic Approximation", "Stochastic Distribution"])
+plt.legend(labels=["Stochastic Distribution"])
 sns.despine()
 plt.show()
